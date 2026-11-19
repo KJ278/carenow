@@ -1,0 +1,6 @@
+{
+  "name": "carenow",
+  "version": "1.0.0",
+  "scripts": { "start": "node carenow.js" },
+  "engines": { "node": ">=18" }
+}
