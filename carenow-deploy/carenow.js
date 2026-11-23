@@ -1,6 +1,8 @@
 // CareNow: backend + customer app + partner app in ONE file. Zero dependencies.
 // Run: node carenow.js   ->  customer http://localhost:3000  |  partner http://localhost:3000/provider
-// Env: PORT, DATA_FILE (where accounts and bookings are stored), ADMIN_KEY (if set, new partners wait for approval).
+// Env: PORT, ADMIN_KEY (if set, new partners wait for approval),
+//      SUPABASE_URL + SUPABASE_KEY (store everything in a free Supabase database so nothing is lost on restart),
+//      DATA_FILE (local backup file, default data.json).
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const DB = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
@@ -35,10 +37,34 @@ let db = {
   ],
 };
 try { db = JSON.parse(fs.readFileSync(DB)); } catch {}
-db.users ||= []; db.sessions ||= {}; db.nextUser ||= db.users.length + 1;
-db.providers.forEach((p) => { if (p.pin) { Object.assign(p, mkPw(p.pin)); delete p.pin; } if (p.approved === undefined) p.approved = true; });
-const save = () => { fs.writeFileSync(DB + '.tmp', JSON.stringify(db, null, 1)); fs.renameSync(DB + '.tmp', DB); };
-save();
+const fix = () => {
+  db.users ||= []; db.sessions ||= {}; db.nextUser ||= db.users.length + 1;
+  db.providers.forEach((p) => { if (p.pin) { Object.assign(p, mkPw(p.pin)); delete p.pin; } if (p.approved === undefined) p.approved = true; });
+};
+
+// ---- storage: a local file always, plus Supabase when SUPABASE_URL and SUPABASE_KEY are set.
+// The whole dataset is one JSON row (table "store"). ponytail: fine for thousands of bookings, move to real tables when it grows.
+const SB = (process.env.SUPABASE_URL || '').replace(/\/+$/, ''), KEY = process.env.SUPABASE_KEY || '';
+const SBH = { apikey: KEY, ...(KEY.startsWith('sb_') ? {} : { Authorization: 'Bearer ' + KEY }) };
+let pushing = false, dirty = false;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const push = () => {
+  if (!SB) return;
+  dirty = true; if (pushing) return; pushing = true;
+  (async () => {
+    while (dirty) {
+      dirty = false;
+      try {
+        const r = await fetch(SB + '/rest/v1/store', { method: 'POST', headers: { ...SBH, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates' }, body: JSON.stringify({ id: 'main', data: db }) });
+        if (!r.ok) throw new Error(r.status + ' ' + (await r.text()).slice(0, 200));
+      } catch (e) { console.error('Database save failed, retrying:', e.message); dirty = true; await sleep(5000); }
+    }
+    pushing = false;
+  })();
+};
+const save = () => { fs.writeFileSync(DB + '.tmp', JSON.stringify(db, null, 1)); fs.renameSync(DB + '.tmp', DB); push(); };
+// on shutdown (Render redeploys send SIGTERM) finish any save in progress
+process.on('SIGTERM', async () => { for (let i = 0; i < 50 && (pushing || dirty); i++) await sleep(200); process.exit(0); });
 
 // ---- helpers
 const send = (res, code, d) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(d)); };
@@ -60,7 +86,7 @@ const fails = {};
 const locked = (k) => fails[k] && fails[k].until > Date.now();
 const fail = (k) => { const f = (fails[k] ||= { n: 0, until: 0 }); if (++f.n >= 5) { f.until = Date.now() + 5 * 6e4; f.n = 0; } };
 
-http.createServer(async (req, res) => {
+const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-key');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -175,4 +201,18 @@ http.createServer(async (req, res) => {
   if (!page) { res.writeHead(404); return res.end('Not found'); }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(page);
-}).listen(process.env.PORT || 3000, () => console.log('CareNow:  customer http://localhost:' + (process.env.PORT || 3000) + '   partner /provider'));
+});
+
+(async () => {
+  if (SB) {
+    // The database is the source of truth. If it cannot be read we stop instead of starting empty and overwriting it.
+    const r = await fetch(SB + '/rest/v1/store?id=eq.main&select=data', { headers: SBH });
+    if (!r.ok) throw new Error('Could not read the database: ' + r.status + ' ' + (await r.text()).slice(0, 200));
+    const rows = await r.json();
+    if (rows.length) db = rows[0].data;
+    console.log(rows.length ? 'Loaded data from the database.' : 'Database is empty, starting fresh.');
+  }
+  fix(); save();
+  const port = process.env.PORT || 3000;
+  server.listen(port, () => console.log('CareNow:  customer http://localhost:' + port + '   partner /provider'));
+})().catch((e) => { console.error(e.message); process.exit(1); });
